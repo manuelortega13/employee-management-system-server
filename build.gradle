@@ -48,6 +48,7 @@ flyway {
 	password.set(providers.gradleProperty('flyway.password'))
 }
 
+
 tasks.named('test') {
 	useJUnitPlatform()
 }
