@@ -1,60 +1,68 @@
 package com.ethan.employee_system.urlshortener;
 
-import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * In-memory URL shortener. Mappings live in process memory only and are lost on
+ * restart (and not shared across instances). The short code is Base62 of a
+ * monotonic id, so it is reversible without storing the code itself.
+ */
 @Service
-@RequiredArgsConstructor
 public class UrlShortenerService {
 
-    private final ShortUrlRepository repository;
+    private final Map<Long, String> idToUrl = new ConcurrentHashMap<>();
+    private final Map<String, Long> urlToId = new ConcurrentHashMap<>();
+    private final AtomicLong sequence = new AtomicLong(0);
 
     @Value("${urlshortener.base-domain:https://my.pass}")
     private String baseDomain;
 
-    @Transactional
     public EncodeResponse encode(EncodeRequest request) {
         String originalUrl = request.url().trim();
         validateUrl(originalUrl);
 
-        ShortUrl shortUrl = repository.findFirstByOriginalUrl(originalUrl)
-                .orElseGet(() -> {
-                    ShortUrl entity = new ShortUrl();
-                    entity.setOriginalUrl(originalUrl);
-                    return repository.save(entity);
-                });
+        // Atomically reuse the existing id for a known URL, or assign a new one.
+        long id = urlToId.computeIfAbsent(originalUrl, url -> {
+            long newId = sequence.incrementAndGet();
+            idToUrl.put(newId, url);
+            return newId;
+        });
 
-        return new EncodeResponse(originalUrl, toShortUrl(shortUrl.getId()));
+        return new EncodeResponse(originalUrl, toShortUrl(id));
     }
 
-    @Transactional(readOnly = true)
     public DecodeResponse decode(DecodeRequest request) {
-        ShortUrl shortUrl = resolve(extractCode(request.url().trim()));
-        return new DecodeResponse(toShortUrl(shortUrl.getId()), shortUrl.getOriginalUrl());
+        long id = parseId(extractCode(request.url().trim()));
+        return new DecodeResponse(toShortUrl(id), lookup(id));
     }
 
-    @Transactional(readOnly = true)
     public String resolveOriginalUrl(String code) {
-        return resolve(code).getOriginalUrl();
+        return lookup(parseId(code));
     }
 
-    private ShortUrl resolve(String code) {
-        long id;
+    private String lookup(long id) {
+        String originalUrl = idToUrl.get(id);
+        if (originalUrl == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Short URL not found");
+        }
+        return originalUrl;
+    }
+
+    private long parseId(String code) {
         try {
-            id = Base62.decode(code);
+            return Base62.decode(code);
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid short URL");
         }
-
-        return repository.findById(id)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Short URL not found"));
     }
 
     private String toShortUrl(long id) {
